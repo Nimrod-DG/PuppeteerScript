@@ -14,7 +14,7 @@ import dotenv from "dotenv";
 dotenv.config();
 // puppeteer-real-browser has shaky TS types, keep it simple:
 const { connect } = require("puppeteer-real-browser") as any;
-
+const MAX_LOGIN_ATTEMPTS = Number(process.env.MAX_LOGIN_ATTEMPTS || 10);
 // ================= CONFIGURATION =================
 const LOGIN_URL = "https://antrean.logammulia.com/login";
 const USERS_URL = "https://antrean.logammulia.com/users";
@@ -44,46 +44,143 @@ function sleep(ms: number) {
   return new Promise<void>((r) => setTimeout(r, ms));
 }
 
+// ================= PATCH START =================
+// Replace ONLY your existing fillInputRobust with this version.
+// Everything else in your 889-line file stays exactly the same.
+
 async function fillInputRobust(
   page: PageLike,
   selector: string,
   value: string | number,
   opts: { attempts?: number; delay?: number; verify?: boolean } = {}
 ) {
-  const { attempts = 3, delay = 20, verify = true } = opts;
+  const { attempts = 4, delay = 10, verify = true } = opts;
 
   await page.waitForSelector(selector, { visible: true, timeout: 20_000 });
 
+  const expected = String(value);
+
   for (let i = 1; i <= attempts; i++) {
-    const el = await page.$(selector);
-    if (!el) throw new Error(`Element not found: ${selector}`);
+    try {
+      const ok = await safeEvaluate<boolean>(
+        page,
+        ({ selector, expected }: any) => {
+          const el = document.querySelector(selector) as HTMLInputElement | HTMLTextAreaElement | null;
+          if (!el) return false;
 
-    await el.focus();
-    await page.keyboard.down(process.platform === "darwin" ? "Meta" : "Control");
-    await page.keyboard.press("KeyA");
-    await page.keyboard.up(process.platform === "darwin" ? "Meta" : "Control");
-    await page.keyboard.press("Backspace");
+          // Focus + scroll into view
+          (el as any).focus?.();
+          (el as any).scrollIntoView?.({ block: "center", inline: "center" });
 
-    await el.type(String(value), { delay });
+          // Use the native value setter (works better with React/Vue/etc)
+          const proto =
+            el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const desc = Object.getOwnPropertyDescriptor(proto, "value");
+          const setter = desc?.set;
 
-    if (!verify) return true;
+          // Clear then set
+          if (setter) {
+            setter.call(el, "");
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
 
-    const ok = await page.$eval(
-      selector,
-      (input: any, expected: string) => input.value === expected,
-      String(value)
+            setter.call(el, expected);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          } else {
+            // Fallback: direct assignment
+            (el as any).value = expected;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+
+          return (el.value ?? "") === expected;
+        },
+        false,
+        { selector, expected }
+      );
+
+      if (ok) return true;
+
+      // If not ok, do a short typing fallback (sometimes sites block setter)
+      const el = await page.$(selector);
+      if (!el) throw new Error(`Element not found: ${selector}`);
+
+      await el.click({ clickCount: 3 });
+      await page.keyboard.press("Backspace");
+
+      // Type slowly; some sites drop keystrokes at speed
+      await page.type(selector, expected, { delay });
+
+      if (!verify) return true;
+
+      const ok2 = await page
+        .$eval(selector, (input: any, exp: string) => (input.value ?? "") === exp, expected)
+        .catch(() => false);
+
+      if (ok2) return true;
+
+      const actual = await page.$eval(selector, (input: any) => input.value).catch(() => "");
+      console.log(
+        `[fill] mismatch attempt ${i}/${attempts} for ${selector}: got len=${String(actual).length}, want len=${expected.length}`
+      );
+
+      await sleep(200);
+    } catch (e: any) {
+      console.log(`[fill] attempt ${i}/${attempts} error on ${selector}:`, e?.message || e);
+      await sleep(250);
+    }
+  }
+
+  const actual = await page.$eval(selector, (input: any) => input.value).catch(() => "");
+  throw new Error(`Failed to fill ${selector}. Expected len=${expected.length}, got len=${String(actual).length}`);
+}
+// ================= PATCH END =================
+async function ensureLoginInputsCorrect(page: PageLike, opts: { attempts?: number } = {}) {
+  const { attempts = 3 } = opts;
+
+  for (let i = 1; i <= attempts; i++) {
+    // Read current DOM values
+    const cur = await safeEvaluate(
+      page,
+      () => ({
+        u: (document.querySelector("#username") as HTMLInputElement | null)?.value ?? "",
+        p: (document.querySelector("#password") as HTMLInputElement | null)?.value ?? "",
+        a: (document.querySelector("#aritmetika") as HTMLInputElement | null)?.value ?? "",
+      }),
+      { u: "", p: "", a: "" }
     );
-    if (ok) return true;
+
+    const wantU = String(USERNAME);
+    const wantP = String(PASSWORD);
+
+    // For aritmetika, compute expected from label again (in case it changed)
+    const label = await page
+      .$eval('label[for="aritmetika"]', (el: any) => el.innerText)
+      .catch(() => "");
+    const wantA = solveMath(label);
+
+    const okU = cur.u === wantU;
+    const okP = cur.p === wantP;
+    const okA = wantA ? cur.a === wantA : true; // if empty label/parse, don't block
+
+    if (okU && okP && okA) return { ok: true as const, cur, want: { u: wantU, p: "***", a: wantA } };
+
+    console.log(
+      `[guard] login inputs mismatch (attempt ${i}/${attempts})`,
+      { okU, okP, okA, got: { uLen: cur.u.length, pLen: cur.p.length, a: cur.a }, wantA }
+    );
+
+    // Re-fill only what is wrong
+    if (!okU) await fillInputRobust(page, "#username", wantU, { delay: 15, verify: true });
+    if (!okP) await fillInputRobust(page, "#password", wantP, { delay: 15, verify: true });
+    if (!okA && wantA) await fillInputRobust(page, "#aritmetika", wantA, { delay: 10, verify: true });
 
     await sleep(150);
   }
 
-  const actual = await page.$eval(selector, (input: any) => input.value).catch(() => "");
-  throw new Error(
-    `Failed to fill ${selector}. Expected len=${String(value).length}, got len=${String(actual).length}`
-  );
+  return { ok: false as const };
 }
-
 function stamp() {
   const now = new Date();
   const y = now.getFullYear();
@@ -160,6 +257,104 @@ async function waitForLoginDOM(page: PageLike, timeout = 120_000) {
   return false;
 }
 
+const HOME_URL = "https://antrean.logammulia.com/home";
+
+async function ensureOnLoginPageEntry(page: PageLike) {
+  const url = String(page.url?.() || "").toLowerCase();
+
+  if (url.includes("/home")) {
+    console.log("[route] on /home -> waiting for Log In button...");
+
+    // ✅ Wait until the blue Log In anchor exists/visible
+    await page
+      .waitForSelector('a.btn-gradient[href*="/login"]', { visible: true, timeout: 20_000 })
+      .catch(() => null);
+
+    // Try clicking via Puppeteer first (most reliable)
+    let clicked = false;
+    try {
+      const a = await page.$('a.btn-gradient[href*="/login"]');
+      if (a) {
+        await a.evaluate((el: any) => el.scrollIntoView({ block: "center" }));
+        await sleep(150);
+        await a.click({ delay: 30 });
+        clicked = true;
+      }
+    } catch {}
+
+    // Fallback: DOM click (your previous approach)
+    if (!clicked) {
+      clicked = await safeEvaluate<boolean>(
+        page,
+        () => {
+          const a: any = document.querySelector('a.btn-gradient[href*="/login"]');
+          if (a) {
+            a.scrollIntoView({ block: "center" });
+            a.click();
+            return true;
+          }
+          return false;
+        },
+        false
+      );
+    }
+
+    if (clicked) {
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => null),
+        (async () => {
+          const start = Date.now();
+          while (Date.now() - start < 20_000) {
+            const u = String(page.url?.() || "").toLowerCase();
+            if (u.includes("/login")) return true;
+            await sleep(200);
+          }
+          return false;
+        })(),
+      ]);
+    }
+
+    const after = String(page.url?.() || "").toLowerCase();
+    if (!after.includes("/login")) {
+      console.log("[route] home click did not reach /login -> goto /login directly");
+      await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    }
+
+    return;
+  }
+
+  if (!url.includes("/login")) {
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  }
+}
+function isLoginUrl(url: string) {
+  return (url || "").toLowerCase().includes("/login");
+}
+
+async function isLoggedInNow(page: PageLike) {
+  // Best signal: logout exists
+  const hasLogout = await safeEvaluate<boolean>(
+    page,
+    () => !!document.querySelector('a[href*="/logout"], a[href*="logout"]'),
+    false
+  );
+  if (hasLogout) return true;
+
+  // If we are on public pages, we are NOT logged in
+  const url = String(page.url?.() || "").toLowerCase();
+  if (url.includes("/login") || url.includes("/home") || url.includes("/register")) return false;
+
+  // Optional: if we're on /antrean and can see #site, treat as logged in
+  const hasSiteSelect = await safeEvaluate<boolean>(
+    page,
+    () => !!document.querySelector("#site"),
+    false
+  );
+  if (hasSiteSelect) return true;
+
+  // Otherwise unknown -> treat as NOT logged in (safer)
+  return false;
+}
 async function waitUntilLoggedIn(page: PageLike, timeout = POST_LOGIN_TIMEOUT) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
@@ -225,7 +420,6 @@ async function waitForCaptchaIfPresent(page: PageLike, timeout = 120_000) {
   );
 
   if (hasTurnstile) {
-    console.log("🔐 Captcha (Turnstile) detected on antrean page. Waiting for you to solve it...");
     const solved = await waitForTurnstileSolved(page, timeout);
     if (!solved) console.log("⚠️ Captcha not solved within timeout. Proceeding anyway (may fail).");
     else console.log("✅ Captcha solved.");
@@ -563,6 +757,100 @@ async function viewSerpongOnce(page: PageLike) {
   return { ok: true as const, site: selRes.chosen, sisa };
 }
 
+// ================= LOGIN (single attempt) =================
+async function performLoginOnce(page: PageLike) {
+  console.log(`[route] ensuring we are on /login entry (handles /home fallback)...`);
+  await ensureOnLoginPageEntry(page);
+
+
+  if (!(await waitForLoginDOM(page, 120_000))) {
+    console.log("❌ Login DOM not found within 120s.");
+    await dump(page, "login_dom_not_found");
+    return { ok: false as const, reason: "login_dom_not_found" };
+  }
+  console.log("✅ Login DOM detected.");
+
+  await fillInputRobust(page, "#username", USERNAME, { delay: 20 });
+  await sleep(150);
+
+  await fillInputRobust(page, "#password", PASSWORD, { delay: 20 });
+  await sleep(150);
+
+  const mathLabel = await page.$eval('label[for="aritmetika"]', (el: any) => el.innerText).catch(() => "");
+  const mathAnswer = solveMath(mathLabel);
+  console.log("[info] math label:", mathLabel);
+  console.log("[info] math ans  :", mathAnswer);
+
+  await fillInputRobust(page, "#aritmetika", mathAnswer, { delay: 10, verify: true });
+  await sleep(200);
+
+  await safeEvaluate<void>(
+    page,
+    () => {
+      const btn: any = document.querySelector("#login");
+      if (btn) btn.scrollIntoView({ block: "center" });
+      window.scrollBy(0, 200);
+    },
+    undefined as any
+  );
+
+  await dump(page, "login_filled_scrolled");
+
+  const tsSolved = await waitForTurnstileSolved(page, 180_000);
+  if (!tsSolved) {
+    console.log("⚠️ Turnstile token not detected within 180s.");
+    await dump(page, "turnstile_not_detected");
+  } else {
+    console.log("✅ Turnstile solved detected (token filled).");
+  }
+
+  await page.waitForSelector("#login", { timeout: 10_000, visible: true });
+  await safeEvaluate<void>(
+    page,
+    () => (document.querySelector("#login") as any)?.scrollIntoView({ block: "center" }),
+    undefined as any
+  );
+  await sleep(200);
+
+  // ✅ Pre-login guard
+  const guard = await ensureLoginInputsCorrect(page, { attempts: 3 });
+  if (!guard.ok) {
+    console.log("❌ Pre-login guard failed: inputs still not correct after retries.");
+    await dump(page, "prelogin_guard_failed");
+    return { ok: false as const, reason: "prelogin_guard_failed" };
+  }
+
+  console.log("[info] clicking login...");
+  try {
+    await page.click("#login");
+  } catch {
+    await safeEvaluate<void>(page, () => (document.querySelector("#login") as any)?.click(), undefined as any);
+  }
+
+  await Promise.race([
+    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: POST_LOGIN_TIMEOUT }).catch(() => {}),
+    (async () => {
+      const start = Date.now();
+      while (Date.now() - start < POST_LOGIN_TIMEOUT) {
+        const url = String(page.url?.() || "").toLowerCase();
+        if (url && !url.includes("/login")) return true;
+        await sleep(300);
+      }
+      return false;
+    })(),
+  ]);
+
+  if (!(await waitUntilLoggedIn(page, POST_LOGIN_TIMEOUT))) {
+    console.log("❌ Login did not complete (still on /login or no logout link).");
+    await dump(page, "login_not_completed");
+    return { ok: false as const, reason: "login_not_completed" };
+  }
+
+  console.log("✅ Logged in.");
+  await dump(page, "logged_in");
+  return { ok: true as const };
+}
+
 // ================= MAIN =================
 (async () => {
   console.log("Launching undetectable browser...");
@@ -590,89 +878,42 @@ async function viewSerpongOnce(page: PageLike) {
   let quitBrowser = true;
 
   try {
-    console.log(`Navigating to ${LOGIN_URL}...`);
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    // Login with capped retries
+    let attempts = 0;
+    while (!(await isLoggedInNow(page))) {
+      attempts++;
+      console.log(`\n🔁 Login attempt ${attempts}/${MAX_LOGIN_ATTEMPTS}`);
 
-    if (!(await waitForLoginDOM(page, 120_000))) {
-      console.log("❌ Login DOM not found within 120s.");
-      await dump(page, "login_dom_not_found");
-      if (!KEEP_BROWSER_OPEN) await browser.close();
-      return;
-    }
-    console.log("✅ Login DOM detected.");
+      const res = await performLoginOnce(page);
+      if (res.ok) break;
 
-    await fillInputRobust(page, "#username", USERNAME, { delay: 20 });
-    await sleep(150);
+      if (attempts >= MAX_LOGIN_ATTEMPTS) {
+        console.log(`🛑 Exceeded MAX_LOGIN_ATTEMPTS=${MAX_LOGIN_ATTEMPTS}. Stopping gracefully.`);
+        await dump(page, "max_login_attempts_reached");
 
-    await fillInputRobust(page, "#password", PASSWORD, { delay: 20 });
-    await sleep(150);
-
-    const mathLabel = await page.$eval('label[for="aritmetika"]', (el: any) => el.innerText).catch(() => "");
-    const mathAnswer = solveMath(mathLabel);
-    console.log("[info] math label:", mathLabel);
-    console.log("[info] math ans  :", mathAnswer);
-
-    await page.click("#aritmetika", { clickCount: 3 }).catch(() => {});
-    await page.type("#aritmetika", mathAnswer, { delay: 10 });
-    await sleep(200);
-
-    await safeEvaluate<void>(
-      page,
-      () => {
-        const btn: any = document.querySelector("#login");
-        if (btn) btn.scrollIntoView({ block: "center" });
-        window.scrollBy(0, 200);
-      },
-      undefined as any
-    );
-
-    await dump(page, "login_filled_scrolled");
-
-    console.log("\nNow solve Turnstile (if shown). I will wait until it is solved...");
-    const tsSolved = await waitForTurnstileSolved(page, 180_000);
-    if (!tsSolved) {
-      console.log("⚠️ Turnstile token not detected within 180s.");
-      await dump(page, "turnstile_not_detected");
-    } else {
-      console.log("✅ Turnstile solved detected (token filled).");
-    }
-
-    await page.waitForSelector("#login", { timeout: 10_000, visible: true });
-    await safeEvaluate<void>(
-      page,
-      () => (document.querySelector("#login") as any)?.scrollIntoView({ block: "center" }),
-      undefined as any
-    );
-    await sleep(200);
-
-    console.log("[info] clicking login...");
-    await page.click("#login");
-
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: POST_LOGIN_TIMEOUT }).catch(() => {}),
-      (async () => {
-        const start = Date.now();
-        while (Date.now() - start < POST_LOGIN_TIMEOUT) {
-          const url = String(page.url?.() || "").toLowerCase();
-          if (url && !url.includes("/login")) return true;
-          await sleep(300);
+        if (KEEP_BROWSER_OPEN) {
+          quitBrowser = false;
+          console.log("\nBrowser will stay open for inspection. Press Ctrl+C to exit.");
+          await new Promise<void>(() => {});
         }
-        return false;
-      })(),
-    ]);
+        return;
+      }
 
-    if (!(await waitUntilLoggedIn(page, POST_LOGIN_TIMEOUT))) {
-      console.log("❌ Login did not complete (still on /login or no logout link).");
-      await dump(page, "login_not_completed");
-      if (!KEEP_BROWSER_OPEN) await browser.close();
-      return;
+      // small backoff
+      await sleep(1500);
     }
-
-    console.log("✅ Logged in.");
-    await dump(page, "logged_in");
 
     console.log("➡️ Redirecting directly to /antrean...");
-    await page.goto(ANTREAN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+await page.goto(ANTREAN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+
+// ✅ If bounced to /home or /login, you are not logged in
+const cur = String(page.url?.() || "").toLowerCase();
+if (cur.includes("/home") || cur.includes("/login")) {
+  console.log(`[auth] bounced to ${cur} -> running login flow now...`);
+  const res = await performLoginOnce(page);
+  if (!res.ok) throw new Error("Login failed after antrean redirect");
+  await page.goto(ANTREAN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+}
 
     await page.waitForSelector("#site", { timeout: 20_000 });
     console.log("✅ /antrean loaded directly.");
