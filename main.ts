@@ -2,9 +2,17 @@
  * - Goes to /antrean
  * - Selects target butik (Serpong)
  * - Clicks "Tampilkan Butik"
- * - Reads "Sisa" then stops (keeps browser open)
+ * - Reads "Sisa"
+ * - If sisa > 0: select wakda, wait captcha, click Ambil Antrean
+ * - Keeps browser open (KEEP_BROWSER_OPEN)
  *
- * Run:
+ * Run (local visible):
+ *   npm start
+ *
+ * Run (headless, e.g. Docker):
+ *   HEADLESS=true npm start
+ *
+ * Run (ts-node):
  *   LM_USER="email" LM_PASS="pass" npx ts-node test.ts
  */
 
@@ -12,9 +20,12 @@ import path from "path";
 import { promises as fs } from "fs";
 import dotenv from "dotenv";
 dotenv.config();
+
 // puppeteer-real-browser has shaky TS types, keep it simple:
 const { connect } = require("puppeteer-real-browser") as any;
+
 const MAX_LOGIN_ATTEMPTS = Number(process.env.MAX_LOGIN_ATTEMPTS || 10);
+
 // ================= CONFIGURATION =================
 const LOGIN_URL = "https://antrean.logammulia.com/login";
 const USERS_URL = "https://antrean.logammulia.com/users";
@@ -30,8 +41,41 @@ const POST_LOGIN_TIMEOUT = 120_000; // 120s
 const OUT_DIR = path.join(__dirname, "debug_out");
 const KEEP_BROWSER_OPEN = true;
 
+// Headless mode – set HEADLESS=true for Docker, false for local visible window
+const HEADLESS = process.env.HEADLESS === "true";
+
 type PageLike = any;
 type BrowserLike = any;
+
+// ================= LOGGING HELPERS =================
+function isoTs() {
+  return new Date().toISOString();
+}
+function log(...args: any[]) {
+  console.log(`[${isoTs()}]`, ...args);
+}
+function warn(...args: any[]) {
+  console.log(`[${isoTs()}] ⚠️`, ...args);
+}
+function errorLog(...args: any[]) {
+  console.log(`[${isoTs()}] ❌`, ...args);
+}
+
+// Progress logger to avoid "looks stuck" in Docker/headless logs
+function startProgress(label: string, everyMs = 10_000) {
+  let alive = true;
+  const t0 = Date.now();
+  const timer = setInterval(() => {
+    if (!alive) return;
+    const sec = Math.floor((Date.now() - t0) / 1000);
+    log(`[progress] ${label} (${sec}s) ...`);
+  }, everyMs);
+
+  return () => {
+    alive = false;
+    clearInterval(timer);
+  };
+}
 
 (async () => {
   try {
@@ -45,9 +89,7 @@ function sleep(ms: number) {
 }
 
 // ================= PATCH START =================
-// Replace ONLY your existing fillInputRobust with this version.
-// Everything else in your 889-line file stays exactly the same.
-
+// fillInputRobust – unchanged (kept for completeness)
 async function fillInputRobust(
   page: PageLike,
   selector: string,
@@ -121,13 +163,13 @@ async function fillInputRobust(
       if (ok2) return true;
 
       const actual = await page.$eval(selector, (input: any) => input.value).catch(() => "");
-      console.log(
+      warn(
         `[fill] mismatch attempt ${i}/${attempts} for ${selector}: got len=${String(actual).length}, want len=${expected.length}`
       );
 
       await sleep(200);
     } catch (e: any) {
-      console.log(`[fill] attempt ${i}/${attempts} error on ${selector}:`, e?.message || e);
+      warn(`[fill] attempt ${i}/${attempts} error on ${selector}:`, e?.message || e);
       await sleep(250);
     }
   }
@@ -136,6 +178,7 @@ async function fillInputRobust(
   throw new Error(`Failed to fill ${selector}. Expected len=${expected.length}, got len=${String(actual).length}`);
 }
 // ================= PATCH END =================
+
 async function ensureLoginInputsCorrect(page: PageLike, opts: { attempts?: number } = {}) {
   const { attempts = 3 } = opts;
 
@@ -166,10 +209,13 @@ async function ensureLoginInputsCorrect(page: PageLike, opts: { attempts?: numbe
 
     if (okU && okP && okA) return { ok: true as const, cur, want: { u: wantU, p: "***", a: wantA } };
 
-    console.log(
-      `[guard] login inputs mismatch (attempt ${i}/${attempts})`,
-      { okU, okP, okA, got: { uLen: cur.u.length, pLen: cur.p.length, a: cur.a }, wantA }
-    );
+    warn(`[guard] login inputs mismatch (attempt ${i}/${attempts})`, {
+      okU,
+      okP,
+      okA,
+      got: { uLen: cur.u.length, pLen: cur.p.length, a: cur.a },
+      wantA,
+    });
 
     // Re-fill only what is wrong
     if (!okU) await fillInputRobust(page, "#username", wantU, { delay: 15, verify: true });
@@ -181,6 +227,7 @@ async function ensureLoginInputsCorrect(page: PageLike, opts: { attempts?: numbe
 
   return { ok: false as const };
 }
+
 function stamp() {
   const now = new Date();
   const y = now.getFullYear();
@@ -198,22 +245,22 @@ async function dump(page: PageLike, tag: string) {
   try {
     const screenshotPath = path.join(OUT_DIR, `${ts}_${tag}.png`);
     await page.screenshot({ path: screenshotPath, fullPage: true });
-    console.log(`[dump] screenshot: ${screenshotPath}`);
+    log(`[dump] screenshot: ${screenshotPath}`);
   } catch (e: any) {
-    console.log("[dump] screenshot failed:", e?.message || e);
+    warn("[dump] screenshot failed:", e?.message || e);
   }
 
   try {
     const htmlPath = path.join(OUT_DIR, `${ts}_${tag}.html`);
     const html = await page.content();
     await fs.writeFile(htmlPath, html, "utf-8");
-    console.log(`[dump] html: ${htmlPath}`);
+    log(`[dump] html: ${htmlPath}`);
   } catch (e: any) {
-    console.log("[dump] html dump failed:", e?.message || e);
+    warn("[dump] html dump failed:", e?.message || e);
   }
 
   try {
-    console.log("[dump] url:", page.url());
+    log("[dump] url:", page.url());
   } catch {}
 }
 
@@ -239,38 +286,159 @@ async function safeEvaluate<T>(page: PageLike, fn: any, fallback: T, ...args: an
   }
 }
 
+// ================= ROBUST CHALLENGE HANDLER =================
+/**
+ * Waits for the Turnstile challenge to be solved.
+ * - Checks for login form
+ * - Checks for Turnstile token field with value
+ * - If still on challenge page after half timeout, reloads once
+ * - Attempts to click the "Verify" checkbox if an iframe is found
+ * @param page Puppeteer page
+ * @param timeout max wait time in ms
+ * @returns true if login DOM is ready, false if timeout
+ */
+async function waitForChallengeAndLoginDOM(page: PageLike, timeout = 300_000): Promise<boolean> {
+  const start = Date.now();
+  const halfTimeout = timeout / 2;
+  let reloaded = false;
+  const stopProgress = startProgress("Waiting for challenge to be solved and login DOM", 10_000);
+
+  try {
+    while (Date.now() - start < timeout) {
+      // Check if login form is present
+      const hasLoginForm = await safeEvaluate<boolean>(
+        page,
+        () =>
+          !!document.querySelector("#username") &&
+          !!document.querySelector("#password") &&
+          !!document.querySelector("#aritmetika") &&
+          !!document.querySelector("#login"),
+        false
+      );
+      if (hasLoginForm) {
+        log("[challenge] Login form detected – challenge solved.");
+        return true;
+      }
+
+      // Check if Turnstile token exists and has a value
+      const tokenSolved = await safeEvaluate<boolean>(
+        page,
+        () => {
+          const tokenField =
+            document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ||
+            document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
+          return !!(tokenField && tokenField.value.trim().length > 0);
+        },
+        false
+      );
+      if (tokenSolved) {
+        log("[challenge] Turnstile token detected – challenge solved.");
+        // Give the page a moment to update
+        await sleep(1000);
+        continue;
+      }
+
+      // Check for Turnstile iframe and try to click the checkbox (fallback)
+      const iframeClicked = await safeEvaluate<boolean>(
+        page,
+        () => {
+          const iframe = document.querySelector<HTMLIFrameElement>('iframe[src*="turnstile"]');
+          if (iframe) {
+            try {
+              // Try to access iframe content and click the checkbox
+              const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+              if (doc) {
+                const checkbox = doc.querySelector('input[type="checkbox"]');
+                if (checkbox) {
+                  (checkbox as HTMLElement).click();
+                  return true;
+                }
+              }
+            } catch (e) {
+              // Cross-origin restrictions – ignore
+            }
+          }
+          return false;
+        },
+        false
+      );
+      if (iframeClicked) {
+        log("[challenge] Clicked Turnstile iframe checkbox.");
+        await sleep(2000);
+      }
+
+      // Check if we are still on the challenge page (by looking for "Verifying you are human")
+      const isChallengePage = await safeEvaluate<boolean>(
+        page,
+        () => {
+          const bodyText = document.body?.innerText || "";
+          return bodyText.includes("Verifying you are human") || bodyText.includes("Ray ID:");
+        },
+        false
+      );
+
+      if (isChallengePage) {
+        log("[challenge] Still on challenge page.");
+        // If we've been waiting for more than half the timeout, try reloading once
+        if (!reloaded && Date.now() - start > halfTimeout) {
+          warn("[challenge] Reloading page to trigger solver...");
+          await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+          reloaded = true;
+          await sleep(2000);
+          continue;
+        }
+      } else {
+        // Not challenge page, but also no login form – maybe something else
+        log("[challenge] Page is not the challenge page, but login form not yet visible.");
+      }
+
+      await sleep(1000);
+    }
+
+    warn(`[challenge] Not solved within ${timeout}ms.`);
+    await dump(page, "challenge_timeout");
+    return false;
+  } finally {
+    stopProgress();
+  }
+}
+
 async function waitForLoginDOM(page: PageLike, timeout = 120_000) {
   const start = Date.now();
-  while (Date.now() - start < timeout) {
-    const ok = await safeEvaluate<boolean>(
-      page,
-      () =>
-        !!document.querySelector("#username") &&
-        !!document.querySelector("#password") &&
-        !!document.querySelector("#aritmetika") &&
-        !!document.querySelector("#login"),
-      false
-    );
-    if (ok) return true;
-    await sleep(300);
+  const stopProgress = startProgress("Waiting for login DOM (#username/#password/#aritmetika/#login)", 10_000);
+  try {
+    while (Date.now() - start < timeout) {
+      const ok = await safeEvaluate<boolean>(
+        page,
+        () =>
+          !!document.querySelector("#username") &&
+          !!document.querySelector("#password") &&
+          !!document.querySelector("#aritmetika") &&
+          !!document.querySelector("#login"),
+        false
+      );
+      if (ok) return true;
+      await sleep(300);
+    }
+    return false;
+  } finally {
+    stopProgress();
   }
-  return false;
 }
 
 const HOME_URL = "https://antrean.logammulia.com/home";
 
 async function ensureOnLoginPageEntry(page: PageLike) {
   const url = String(page.url?.() || "").toLowerCase();
+  log("[route] current url:", url);
 
   if (url.includes("/home")) {
-    console.log("[route] on /home -> waiting for Log In button...");
+    log("[route] on /home -> waiting for Log In button...");
 
-    // ✅ Wait until the blue Log In anchor exists/visible
     await page
       .waitForSelector('a.btn-gradient[href*="/login"]', { visible: true, timeout: 20_000 })
       .catch(() => null);
 
-    // Try clicking via Puppeteer first (most reliable)
     let clicked = false;
     try {
       const a = await page.$('a.btn-gradient[href*="/login"]');
@@ -279,10 +447,10 @@ async function ensureOnLoginPageEntry(page: PageLike) {
         await sleep(150);
         await a.click({ delay: 30 });
         clicked = true;
+        log("[route] clicked login button from /home");
       }
     } catch {}
 
-    // Fallback: DOM click (your previous approach)
     if (!clicked) {
       clicked = await safeEvaluate<boolean>(
         page,
@@ -297,6 +465,7 @@ async function ensureOnLoginPageEntry(page: PageLike) {
         },
         false
       );
+      if (clicked) log("[route] clicked login via DOM fallback from /home");
     }
 
     if (clicked) {
@@ -315,24 +484,25 @@ async function ensureOnLoginPageEntry(page: PageLike) {
     }
 
     const after = String(page.url?.() || "").toLowerCase();
+    log("[route] after home->login attempt url:", after);
     if (!after.includes("/login")) {
-      console.log("[route] home click did not reach /login -> goto /login directly");
+      warn("[route] home click did not reach /login -> goto /login directly");
       await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
     }
-
     return;
   }
 
   if (!url.includes("/login")) {
+    log("[route] not on /login -> goto /login");
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
 }
+
 function isLoginUrl(url: string) {
   return (url || "").toLowerCase().includes("/login");
 }
 
 async function isLoggedInNow(page: PageLike) {
-  // Best signal: logout exists
   const hasLogout = await safeEvaluate<boolean>(
     page,
     () => !!document.querySelector('a[href*="/logout"], a[href*="logout"]'),
@@ -340,42 +510,52 @@ async function isLoggedInNow(page: PageLike) {
   );
   if (hasLogout) return true;
 
-  // If we are on public pages, we are NOT logged in
   const url = String(page.url?.() || "").toLowerCase();
   if (url.includes("/login") || url.includes("/home") || url.includes("/register")) return false;
 
-  // Optional: if we're on /antrean and can see #site, treat as logged in
-  const hasSiteSelect = await safeEvaluate<boolean>(
-    page,
-    () => !!document.querySelector("#site"),
-    false
-  );
+  const hasSiteSelect = await safeEvaluate<boolean>(page, () => !!document.querySelector("#site"), false);
   if (hasSiteSelect) return true;
 
-  // Otherwise unknown -> treat as NOT logged in (safer)
   return false;
 }
+
 async function waitUntilLoggedIn(page: PageLike, timeout = POST_LOGIN_TIMEOUT) {
   const start = Date.now();
-  while (Date.now() - start < timeout) {
-    const url = String(page.url?.() || "").toLowerCase();
-    if (url && !url.includes("/login")) return true;
+  const stopProgress = startProgress("Waiting until logged in (url != /login OR logout link visible)", 10_000);
+  try {
+    while (Date.now() - start < timeout) {
+      const url = String(page.url?.() || "").toLowerCase();
+      if (url && !url.includes("/login")) return true;
 
-    const hasLogout = await safeEvaluate<boolean>(
-      page,
-      () => !!document.querySelector('a[href*="/logout"], a[href*="logout"]'),
-      false
-    );
-    if (hasLogout) return true;
+      const hasLogout = await safeEvaluate<boolean>(
+        page,
+        () => !!document.querySelector('a[href*="/logout"], a[href*="logout"]'),
+        false
+      );
+      if (hasLogout) return true;
 
-    await sleep(400);
+      await sleep(400);
+    }
+    return false;
+  } finally {
+    stopProgress();
   }
-  return false;
 }
 
-async function waitForTurnstileSolved(page: PageLike, timeout = 180_000) {
+// ================= MODIFIED TURNSTILE HANDLER =================
+/**
+ * Waits for Cloudflare Turnstile to be solved.
+ * Checks for a non‑empty token in textarea/input[name="cf-turnstile-response"]
+ * Also considers the challenge solved if the token field disappears (e.g., redirect).
+ * @param page Puppeteer page
+ * @param timeout max wait time in ms
+ * @returns true if solved, false if timeout
+ */
+async function waitForTurnstileSolved(page: PageLike, timeout = 180_000): Promise<boolean> {
   const start = Date.now();
+  const stopProgress = startProgress("Waiting for Turnstile token (cf-turnstile-response)", 10_000);
 
+  // Ensure the button is visible (helps in headless)
   await safeEvaluate<void>(
     page,
     () => {
@@ -386,25 +566,46 @@ async function waitForTurnstileSolved(page: PageLike, timeout = 180_000) {
     undefined as any
   );
 
-  while (Date.now() - start < timeout) {
-    const solved = await safeEvaluate<boolean>(
-      page,
-      () => {
-        const t1: any = document.querySelector('textarea[name="cf-turnstile-response"]');
-        if (t1 && (t1.value || "").trim().length > 0) return true;
+  try {
+    while (Date.now() - start < timeout) {
+      // Check if the token field exists and has a value
+      const solved = await safeEvaluate<boolean>(
+        page,
+        () => {
+          // Look for the hidden token field (textarea or input)
+          const tokenField =
+            document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ||
+            document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
+          if (tokenField && tokenField.value.trim().length > 0) {
+            return true; // token present → solved
+          }
 
-        const i1: any = document.querySelector('input[name="cf-turnstile-response"]');
-        if (i1 && (i1.value || "").trim().length > 0) return true;
+          // If the token field itself is gone, the challenge may have been removed (e.g., redirect)
+          if (!tokenField) {
+            // Additionally check if the page no longer contains the typical Turnstile container
+            const turnstileContainer = document.querySelector('.cf-turnstile, [class*="turnstile"]');
+            if (!turnstileContainer) return true; // no token field and no container → probably solved
+          }
 
-        return false;
-      },
-      false
-    );
+          return false;
+        },
+        false
+      );
 
-    if (solved) return true;
-    await sleep(500);
+      if (solved) {
+        log("[Turnstile] detected solved (token present or challenge removed).");
+        return true;
+      }
+
+      await sleep(500);
+    }
+
+    warn(`[Turnstile] not solved within ${timeout}ms.`);
+    await dump(page, "turnstile_timeout");
+    return false;
+  } finally {
+    stopProgress();
   }
-  return false;
 }
 
 // ================= CAPTCHA HANDLER FOR ANTREAN PAGE =================
@@ -420,12 +621,14 @@ async function waitForCaptchaIfPresent(page: PageLike, timeout = 120_000) {
   );
 
   if (hasTurnstile) {
+    log("[captcha] Turnstile detected on antrean page, waiting solve...");
     const solved = await waitForTurnstileSolved(page, timeout);
-    if (!solved) console.log("⚠️ Captcha not solved within timeout. Proceeding anyway (may fail).");
-    else console.log("✅ Captcha solved.");
+    if (!solved) warn("[captcha] not solved within timeout. Proceeding anyway (may fail).");
+    else log("[captcha] solved.");
     return;
   }
 
+  // Legacy captcha check (reCAPTCHA etc.) – unchanged
   const checkboxSelectors = [
     'input[type="checkbox"][class*="captcha"]',
     "#captcha",
@@ -436,19 +639,19 @@ async function waitForCaptchaIfPresent(page: PageLike, timeout = 120_000) {
   for (const sel of checkboxSelectors) {
     const element = await page.$(sel).catch(() => null);
     if (element) {
-      console.log(`🔲 Simple captcha element found (${sel}). Attempting to click it...`);
+      log(`[captcha] element found (${sel}). Attempting click...`);
       try {
         await element.click();
         await sleep(1000);
-        console.log("✅ Captcha checkbox clicked.");
+        log("[captcha] checkbox clicked.");
       } catch (e: any) {
-        console.log(`❌ Failed to click captcha checkbox: ${e?.message || e}`);
+        warn(`[captcha] failed to click checkbox: ${e?.message || e}`);
       }
       return;
     }
   }
 
-  console.log("ℹ️ No captcha element detected on antrean page.");
+  log("[captcha] no captcha element detected on antrean page.");
 }
 
 // ================= ANTREAN INTERACTION =================
@@ -657,15 +860,17 @@ async function selectFirstWakdaOption(page: PageLike, opts: { skipZeroSlots?: bo
 
 // ================= VIEW SERPONG =================
 async function viewSerpongOnce(page: PageLike) {
+  log("[antrean] ensure on /antrean");
   if (!String(page.url?.() || "").toLowerCase().includes("/antrean")) {
     await page.goto(ANTREAN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
 
+  log("[antrean] wait #site");
   await page.waitForSelector("#site", { timeout: 20_000 });
 
   const options = await getSiteOptions(page);
   if (!options.length) {
-    console.log("❌ No site options found.");
+    errorLog("No site options found.");
     await dump(page, "no_site_options");
     return { ok: false as const, reason: "no_site_options" };
   }
@@ -673,22 +878,24 @@ async function viewSerpongOnce(page: PageLike) {
   const selRes = await selectSiteRobust(page, { value: TARGET_SITE_VALUE, label: TARGET_SITE_LABEL });
 
   if (!selRes.ok) {
-    console.log("❌ Failed selecting site:", selRes.reason);
-    console.log("   Available options sample:", options.slice(0, 10));
+    errorLog("Failed selecting site:", selRes.reason);
+    log("Available options sample:", options.slice(0, 10));
     await dump(page, "select_site_failed");
     return { ok: false as const, reason: "select_site_failed", details: selRes };
   }
 
-  console.log(`[ok] Selected site: ${selRes.chosen.value} - ${selRes.chosen.text}`);
+  log(`[ok] Selected site: ${selRes.chosen.value} - ${selRes.chosen.text}`);
   await sleep(250);
 
+  log(`[antrean] click "Tampilkan Butik"`);
   const clicked = await clickTampilkanButikByText(page);
   if (!clicked) {
-    console.log("❌ Could not click 'Tampilkan Butik' button.");
+    errorLog(`Could not click "Tampilkan Butik" button.`);
     await dump(page, "click_tampilkan_failed");
     return { ok: false as const, reason: "click_tampilkan_failed" };
   }
 
+  log("[antrean] wait result ready (Sisa/form)...");
   await Promise.race([
     page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 12_000 }).catch(() => null),
     (async () => {
@@ -710,40 +917,41 @@ async function viewSerpongOnce(page: PageLike) {
   const sisa = await readSisa(page);
   await dump(page, `serpong_result_sisa_${sisa}`);
 
-  console.log(`\n===== RESULT =====`);
-  console.log(`Butik: ${selRes.chosen.text}`);
-  console.log(`Sisa : ${sisa}\n`);
+  log("===== RESULT =====");
+  log(`Butik: ${selRes.chosen.text}`);
+  log(`Sisa : ${sisa}`);
 
+  // ✅ LOGIC UNCHANGED BELOW
   if (Number(sisa) > 0) {
-    console.log("🟡 sisa > 0 -> select wakda then handle captcha and click Ambil Antrean...");
+    log("🟡 sisa > 0 -> select wakda then handle captcha and click Ambil Antrean...");
 
     await page.waitForSelector("#wakda", { timeout: 20_000 });
 
     const wakdaRes = await selectFirstWakdaOption(page, { skipZeroSlots: false });
     if (!wakdaRes.ok) {
-      console.log("❌ Failed selecting wakda:", wakdaRes.reason);
+      errorLog("Failed selecting wakda:", wakdaRes.reason);
       await dump(page, "select_wakda_failed");
       return {
         ok: true as const,
         site: selRes.chosen,
         sisa,
-        auto: { step: "select_wakda", ...wakdaRes }, // no duplicate ok
+        auto: { step: "select_wakda", ...wakdaRes },
       };
     }
 
-    console.log(`✅ wakda selected: ${wakdaRes.chosen.value} - ${wakdaRes.chosen.text}`);
+    log(`✅ wakda selected: ${wakdaRes.chosen.value} - ${wakdaRes.chosen.text}`);
     await sleep(250);
 
     await waitForCaptchaIfPresent(page);
 
     const ambilClicked = await clickAmbilAntrean(page);
     if (!ambilClicked) {
-      console.log("❌ Could not click 'Ambil Antrean'.");
+      errorLog(`Could not click "Ambil Antrean".`);
       await dump(page, "click_ambil_failed");
       return { ok: true as const, site: selRes.chosen, sisa, auto: { ok: false, step: "click_ambil" } };
     }
 
-    console.log("✅ Clicked Ambil Antrean.");
+    log("✅ Clicked Ambil Antrean.");
     await dump(page, "clicked_ambil_antrean");
 
     return {
@@ -759,28 +967,30 @@ async function viewSerpongOnce(page: PageLike) {
 
 // ================= LOGIN (single attempt) =================
 async function performLoginOnce(page: PageLike) {
-  console.log(`[route] ensuring we are on /login entry (handles /home fallback)...`);
+  log(`[route] ensuring we are on /login entry (handles /home fallback)...`);
   await ensureOnLoginPageEntry(page);
 
-
-  if (!(await waitForLoginDOM(page, 120_000))) {
-    console.log("❌ Login DOM not found within 120s.");
-    await dump(page, "login_dom_not_found");
-    return { ok: false as const, reason: "login_dom_not_found" };
+if (!(await waitForChallengeAndLoginDOM(page, 1_000))) {
+    errorLog("Login DOM not found within timeout (challenge may not have been solved).");
+    await dump(page, "login_dom_not_found_after_challenge");
+    return { ok: false as const, reason: "challenge_not_solved" };
   }
-  console.log("✅ Login DOM detected.");
+  log("✅ Login DOM detected after challenge.");
 
+  log("[login] fill username");
   await fillInputRobust(page, "#username", USERNAME, { delay: 20 });
   await sleep(150);
 
+  log("[login] fill password");
   await fillInputRobust(page, "#password", PASSWORD, { delay: 20 });
   await sleep(150);
 
   const mathLabel = await page.$eval('label[for="aritmetika"]', (el: any) => el.innerText).catch(() => "");
   const mathAnswer = solveMath(mathLabel);
-  console.log("[info] math label:", mathLabel);
-  console.log("[info] math ans  :", mathAnswer);
+  log("[login] math label:", mathLabel);
+  log("[login] math ans  :", mathAnswer);
 
+  log("[login] fill aritmetika");
   await fillInputRobust(page, "#aritmetika", mathAnswer, { delay: 10, verify: true });
   await sleep(200);
 
@@ -796,12 +1006,13 @@ async function performLoginOnce(page: PageLike) {
 
   await dump(page, "login_filled_scrolled");
 
+  log("[login] wait turnstile token...");
   const tsSolved = await waitForTurnstileSolved(page, 180_000);
   if (!tsSolved) {
-    console.log("⚠️ Turnstile token not detected within 180s.");
+    warn("Turnstile token not detected within 180s.");
     await dump(page, "turnstile_not_detected");
   } else {
-    console.log("✅ Turnstile solved detected (token filled).");
+    log("✅ Turnstile solved detected (token filled).");
   }
 
   await page.waitForSelector("#login", { timeout: 10_000, visible: true });
@@ -812,21 +1023,22 @@ async function performLoginOnce(page: PageLike) {
   );
   await sleep(200);
 
-  // ✅ Pre-login guard
+  // ✅ Pre-login guard (unchanged)
   const guard = await ensureLoginInputsCorrect(page, { attempts: 3 });
   if (!guard.ok) {
-    console.log("❌ Pre-login guard failed: inputs still not correct after retries.");
+    errorLog("Pre-login guard failed: inputs still not correct after retries.");
     await dump(page, "prelogin_guard_failed");
     return { ok: false as const, reason: "prelogin_guard_failed" };
   }
 
-  console.log("[info] clicking login...");
+  log("[login] clicking login...");
   try {
     await page.click("#login");
   } catch {
     await safeEvaluate<void>(page, () => (document.querySelector("#login") as any)?.click(), undefined as any);
   }
 
+  log("[login] wait navigation...");
   await Promise.race([
     page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: POST_LOGIN_TIMEOUT }).catch(() => {}),
     (async () => {
@@ -841,27 +1053,46 @@ async function performLoginOnce(page: PageLike) {
   ]);
 
   if (!(await waitUntilLoggedIn(page, POST_LOGIN_TIMEOUT))) {
-    console.log("❌ Login did not complete (still on /login or no logout link).");
+    errorLog("Login did not complete (still on /login or no logout link).");
     await dump(page, "login_not_completed");
     return { ok: false as const, reason: "login_not_completed" };
   }
 
-  console.log("✅ Logged in.");
+  log("✅ Logged in.");
   await dump(page, "logged_in");
   return { ok: true as const };
 }
 
 // ================= MAIN =================
 (async () => {
-  console.log("Launching undetectable browser...");
-  const { browser, page }: { browser: BrowserLike; page: PageLike } = await connect({
-    headless: false,
-    turnstile: true,
-    defaultViewport: null,
-    args: ["--start-maximized", "--window-position=0,0"],
+  log("Launching undetectable browser...");
+  log("Config:", {
+    MAX_LOGIN_ATTEMPTS,
+    POST_LOGIN_TIMEOUT,
+    OUT_DIR,
+    KEEP_BROWSER_OPEN,
+    HEADLESS,               // show the headless setting
+    userProvided: {
+      LM_USER: !!process.env.LM_USER,
+      LM_PASS: !!process.env.LM_PASS,
+    },
   });
 
-  // IMPORTANT: sometimes screen width reads 0 during navigation; guard it.
+  const { browser, page }: { browser: BrowserLike; page: PageLike } = await connect({
+    headless: HEADLESS,      // use environment variable
+    turnstile: true,         // keep Turnstile solving enabled
+    defaultViewport: null,
+    args: HEADLESS
+      ? [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",  // Helps in Docker with limited /dev/shm
+          "--disable-gpu",             // Often needed in headless environments
+          "--window-size=1366,768"
+        ]
+      : ["--start-maximized", "--window-position=0,0"],
+  });
+
   const screen = await page.evaluate(() => ({
     width: window.screen.width || 1366,
     height: window.screen.height || 768,
@@ -874,67 +1105,64 @@ async function performLoginOnce(page: PageLike) {
     deviceScaleFactor: Number(screen.dpr) || 1,
   });
 
-  console.log("[viewport]", screen);
+  log("[viewport]", screen);
   let quitBrowser = true;
 
   try {
-    // Login with capped retries
     let attempts = 0;
     while (!(await isLoggedInNow(page))) {
       attempts++;
-      console.log(`\n🔁 Login attempt ${attempts}/${MAX_LOGIN_ATTEMPTS}`);
+      log(`🔁 Login attempt ${attempts}/${MAX_LOGIN_ATTEMPTS}`);
 
       const res = await performLoginOnce(page);
       if (res.ok) break;
 
       if (attempts >= MAX_LOGIN_ATTEMPTS) {
-        console.log(`🛑 Exceeded MAX_LOGIN_ATTEMPTS=${MAX_LOGIN_ATTEMPTS}. Stopping gracefully.`);
+        errorLog(`Exceeded MAX_LOGIN_ATTEMPTS=${MAX_LOGIN_ATTEMPTS}. Stopping gracefully.`);
         await dump(page, "max_login_attempts_reached");
 
         if (KEEP_BROWSER_OPEN) {
           quitBrowser = false;
-          console.log("\nBrowser will stay open for inspection. Press Ctrl+C to exit.");
+          log("Browser will stay open for inspection. Press Ctrl+C to exit.");
           await new Promise<void>(() => {});
         }
         return;
       }
 
-      // small backoff
       await sleep(1500);
     }
 
-    console.log("➡️ Redirecting directly to /antrean...");
-await page.goto(ANTREAN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    log("➡️ Redirecting directly to /antrean...");
+    await page.goto(ANTREAN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
 
-// ✅ If bounced to /home or /login, you are not logged in
-const cur = String(page.url?.() || "").toLowerCase();
-if (cur.includes("/home") || cur.includes("/login")) {
-  console.log(`[auth] bounced to ${cur} -> running login flow now...`);
-  const res = await performLoginOnce(page);
-  if (!res.ok) throw new Error("Login failed after antrean redirect");
-  await page.goto(ANTREAN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
-}
+    const cur = String(page.url?.() || "").toLowerCase();
+    if (cur.includes("/home") || cur.includes("/login")) {
+      warn(`[auth] bounced to ${cur} -> running login flow now...`);
+      const res = await performLoginOnce(page);
+      if (!res.ok) throw new Error("Login failed after antrean redirect");
+      await page.goto(ANTREAN_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    }
 
     await page.waitForSelector("#site", { timeout: 20_000 });
-    console.log("✅ /antrean loaded directly.");
+    log("✅ /antrean loaded directly.");
 
     const result = await viewSerpongOnce(page);
 
-    console.log("\n✅ Final Result:");
-    console.log(JSON.stringify(result, null, 2));
+    log("✅ Final Result:");
+    log(JSON.stringify(result, null, 2));
 
     if (KEEP_BROWSER_OPEN) {
       quitBrowser = false;
-      console.log("\nBrowser will stay open. Press Ctrl+C to exit.");
+      log("Browser will stay open. Press Ctrl+C to exit.");
       await new Promise<void>(() => {});
     }
-  } catch (err: any) {
-    console.error("❌ Fatal error:", err?.message || err);
+  } catch (e: any) {
+    errorLog("Fatal error:", e?.message || e);
     try {
       await dump(page, "fatal_error");
     } catch {}
     quitBrowser = false;
-    console.log("Keeping browser open for inspection. Press Ctrl+C to exit.");
+    log("Keeping browser open for inspection. Press Ctrl+C to exit.");
     await new Promise<void>(() => {});
   } finally {
     if (quitBrowser) await browser.close();
