@@ -43,6 +43,7 @@ const KEEP_BROWSER_OPEN = true;
 
 // Headless mode – set HEADLESS=true for Docker, false for local visible window
 const HEADLESS = process.env.HEADLESS === "true";
+const SCHEDULED_WIB = process.env.SCHEDULED_WIB === "true";
 
 type PageLike = any;
 type BrowserLike = any;
@@ -51,6 +52,18 @@ type BrowserLike = any;
 function isoTs() {
   return new Date().toISOString();
 }
+function makeRunDirName() {
+  const now = new Date();
+  const d = String(now.getDate()).padStart(2, "0");
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const y = now.getFullYear();
+  const h = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  const s = String(now.getSeconds()).padStart(2, "0");
+  return `${d}-${m}-${y}_${h}-${min}-${s}`;
+}
+const RUN_DIR_NAME = makeRunDirName();
+const RUN_DIR = path.join(OUT_DIR, RUN_DIR_NAME);
 function log(...args: any[]) {
   console.log(`[${isoTs()}]`, ...args);
 }
@@ -80,12 +93,39 @@ function startProgress(label: string, everyMs = 10_000) {
 (async () => {
   try {
     await fs.mkdir(OUT_DIR, { recursive: true });
+    await fs.mkdir(RUN_DIR, { recursive: true });
   } catch {}
 })();
 
 // ================= HELPERS =================
 function sleep(ms: number) {
   return new Promise<void>((r) => setTimeout(r, ms));
+}
+
+function nowWib() {
+  const offsetMs = 7 * 60 * 60 * 1000;
+  return new Date(Date.now() + offsetMs);
+}
+
+function msUntilWib(hour: number, minute: number) {
+  const now = nowWib();
+  const target = new Date(now);
+  target.setHours(hour, minute, 0, 0);
+  if (target.getTime() <= now.getTime()) {
+    target.setDate(target.getDate() + 1);
+  }
+  return target.getTime() - now.getTime();
+}
+
+async function waitUntilWib(hour: number, minute: number, label?: string) {
+  const ms = msUntilWib(hour, minute);
+  if (ms <= 0) {
+    return;
+  }
+  const minutes = Math.round(ms / 60000);
+  const targetLabel = label || `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")} WIB`;
+  log(`[schedule] waiting ~${minutes} minutes until ${targetLabel}`);
+  await sleep(ms);
 }
 
 // ================= PATCH START =================
@@ -243,7 +283,7 @@ async function dump(page: PageLike, tag: string) {
   const ts = stamp();
 
   try {
-    const screenshotPath = path.join(OUT_DIR, `${ts}_${tag}.png`);
+    const screenshotPath = path.join(RUN_DIR, `${ts}_${tag}.png`);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     log(`[dump] screenshot: ${screenshotPath}`);
   } catch (e: any) {
@@ -251,7 +291,7 @@ async function dump(page: PageLike, tag: string) {
   }
 
   try {
-    const htmlPath = path.join(OUT_DIR, `${ts}_${tag}.html`);
+    const htmlPath = path.join(RUN_DIR, `${ts}_${tag}.html`);
     const html = await page.content();
     await fs.writeFile(htmlPath, html, "utf-8");
     log(`[dump] html: ${htmlPath}`);
@@ -1072,11 +1112,16 @@ if (!(await waitForChallengeAndLoginDOM(page, 1_000))) {
     OUT_DIR,
     KEEP_BROWSER_OPEN,
     HEADLESS,               // show the headless setting
+    SCHEDULED_WIB,
     userProvided: {
       LM_USER: !!process.env.LM_USER,
       LM_PASS: !!process.env.LM_PASS,
     },
   });
+
+  if (SCHEDULED_WIB) {
+    await waitUntilWib(6, 58, "06:58 WIB (login start)");
+  }
 
   const { browser, page }: { browser: BrowserLike; page: PageLike } = await connect({
     headless: HEADLESS,      // use environment variable
@@ -1130,6 +1175,10 @@ if (!(await waitForChallengeAndLoginDOM(page, 1_000))) {
       }
 
       await sleep(1500);
+    }
+
+    if (SCHEDULED_WIB) {
+      await waitUntilWib(7, 0, "07:00 WIB (/antrean)");
     }
 
     log("➡️ Redirecting directly to /antrean...");
